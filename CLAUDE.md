@@ -22,7 +22,31 @@ firebase functions:log # view logs
 
 ## Functions
 
-### saveDoc
+### retrieveLiveKitToken (v2 callable)
+
+Called by Flutter client to get a LiveKit token for joining a room.
+
+```javascript
+exports.retrieveLiveKitToken = onCall(async (request) => { ... });
+```
+
+**Parameters:** `{ roomName: string }`
+**Returns:** LiveKit JWT token
+**Auth:** Requires authenticated user
+
+### getBotToken (v2 callable)
+
+Called by bot service to get a LiveKit token for joining as `bot-claude`.
+
+```javascript
+exports.getBotToken = onCall(async (request) => { ... });
+```
+
+**Parameters:** `{ roomName: string, botSecret: string }`
+**Returns:** LiveKit JWT token
+**Auth:** Requires matching `BOT_SECRET` env var
+
+### saveDoc (v1 auth trigger)
 
 Auth trigger that fires on user creation:
 
@@ -50,6 +74,7 @@ Create `functions/.env`:
 ```sh
 LIVEKIT_API_KEY=<your-api-key>
 LIVEKIT_API_SECRET=<your-api-secret>
+BOT_SECRET=<secure-secret-for-bot-auth>
 ```
 
 ## Dependencies
