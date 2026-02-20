@@ -59,7 +59,7 @@ exports.retrieveLiveKitToken = onCall(async (request) => {
 
   // Dispatch the Clawd bot agent when this user joins the room.
   at.roomConfig = new RoomConfiguration({
-    agents: [new RoomAgentDispatch({agentName: ""})],
+    agents: [new RoomAgentDispatch({agentName: "clawd"})],
   });
 
   const token = await at.toJwt();
