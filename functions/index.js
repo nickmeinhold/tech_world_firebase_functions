@@ -29,7 +29,11 @@ exports.retrieveLiveKitToken = onCall(async (request) => {
     throw new HttpsError("invalid-argument", "roomName is required");
   }
 
-  const {AccessToken} = await import("livekit-server-sdk");
+  const {
+    AccessToken,
+    RoomAgentDispatch,
+    RoomConfiguration,
+  } = await import("livekit-server-sdk");
 
   const userName = request.auth.token.name ||
                    request.auth.token.email ||
@@ -51,6 +55,11 @@ exports.retrieveLiveKitToken = onCall(async (request) => {
     canPublish: true,
     canPublishData: true,
     canSubscribe: true,
+  });
+
+  // Dispatch the Clawd bot agent when this user joins the room.
+  at.roomConfig = new RoomConfiguration({
+    agents: [new RoomAgentDispatch({agentName: ""})],
   });
 
   const token = await at.toJwt();
