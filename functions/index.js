@@ -74,9 +74,17 @@ exports.retrieveLiveKitToken = onCall(async (request) => {
  * The bot joins as 'bot-claude' participant.
  */
 exports.getBotToken = onCall(async (request) => {
-  // Verify request contains bot secret (simple auth for bot service)
-  const botSecret = request.data.botSecret;
-  if (botSecret !== process.env.BOT_SECRET) {
+  // Verify request contains bot secret using timing-safe comparison.
+  // Guards against: (1) undefined BOT_SECRET env var, (2) timing attacks.
+  const crypto = require("crypto");
+  const expected = process.env.BOT_SECRET;
+  const provided = request.data.botSecret;
+  if (!expected || !provided || typeof provided !== "string") {
+    throw new HttpsError("permission-denied", "Invalid bot credentials");
+  }
+  const expectedHash = crypto.createHash("sha256").update(expected).digest();
+  const providedHash = crypto.createHash("sha256").update(provided).digest();
+  if (!crypto.timingSafeEqual(expectedHash, providedHash)) {
     throw new HttpsError("permission-denied", "Invalid bot credentials");
   }
 

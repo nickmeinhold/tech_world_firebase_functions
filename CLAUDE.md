@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Firebase Cloud Functions (Node.js) for Tech World. Handles user creation and LiveKit token generation.
+Firebase Cloud Functions (Node.js) for Tech World. Handles user creation, LiveKit token generation with agent dispatch, and Cloud Run bot wake-up.
 
 ## Build & Run
 
@@ -18,56 +18,33 @@ firebase functions:log # view logs
 
 - `functions/index.js`: Cloud function definitions
 - `functions/package.json`: Node.js dependencies
-- `functions/.env`: Environment variables (LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+- `functions/.env`: Environment variables
 
 ## Functions
 
 ### retrieveLiveKitToken (v2 callable)
 
-Called by Flutter client to get a LiveKit token for joining a room. Includes agent dispatch configuration so the Clawd bot is automatically dispatched when users connect.
-
-```javascript
-exports.retrieveLiveKitToken = onCall(async (request) => { ... });
-```
+Called by Flutter client to get a LiveKit token for joining a room. Dispatches both bot agents (Clawd and Gremlin) and wakes their Cloud Run services.
 
 **Parameters:** `{ roomName: string }`
 **Returns:** LiveKit JWT token
 **Auth:** Requires authenticated user
 
-**Agent dispatch:** The token includes a `RoomConfiguration` with `RoomAgentDispatch` (empty `agentName` = dispatch to any available worker). This ensures the bot is dispatched every time a user joins, regardless of whether the room is new or already exists. See "Agent Dispatch" section below for details.
+**Agent dispatch:** The token includes `RoomConfiguration` with named `RoomAgentDispatch` entries for `"clawd"` and `"gremlin"`. LiveKit dispatches both bots when the user joins.
+
+**Bot wake-up:** Calls `wakeBots()` which sends fire-and-forget HTTP POST requests to the Cloud Run bot services using IAM-authenticated `google-auth-library`. This ensures containers are warm for the dispatch. Failures are logged but don't block token generation.
 
 ### getBotToken (v2 callable)
 
-Called by bot service to get a LiveKit token for joining as `bot-claude`.
-
-```javascript
-exports.getBotToken = onCall(async (request) => { ... });
-```
+Called by bot service to get a LiveKit token for joining as a bot participant.
 
 **Parameters:** `{ roomName: string, botSecret: string }`
 **Returns:** LiveKit JWT token
-**Auth:** Requires matching `BOT_SECRET` env var
+**Auth:** Requires matching `BOT_SECRET` env var (timing-safe comparison)
 
 ### saveDoc (v1 auth trigger)
 
-Auth trigger that fires on user creation:
-
-```javascript
-exports.saveDoc = functions.auth.user().onCreate(async (user) => { ... });
-```
-
-**What it does:**
-
-1. Gets user info (email, uid) from auth event
-2. Creates LiveKit AccessToken with:
-   - Identity: user.uid
-   - Name: user.email (or "Guest")
-   - TTL: 10 minutes
-   - Grant: roomJoin for "room"
-3. Stores in Firestore `users/{uid}`:
-   - name: displayName
-   - email: email
-   - token: LiveKit JWT
+Auth trigger that fires on user creation. Stores user info and a short-lived LiveKit token in Firestore.
 
 ## Configuration Required
 
@@ -77,6 +54,8 @@ Create `functions/.env`:
 LIVEKIT_API_KEY=<your-api-key>
 LIVEKIT_API_SECRET=<your-api-secret>
 BOT_SECRET=<secure-secret-for-bot-auth>
+CLAWD_BOT_URL=https://clawd-bot-<id>.us-central1.run.app
+GREMLIN_BOT_URL=https://gremlin-bot-<id>.us-central1.run.app
 ```
 
 ## Dependencies
@@ -84,29 +63,17 @@ BOT_SECRET=<secure-secret-for-bot-auth>
 - `firebase-functions`: v5.0.0
 - `firebase-admin`: v12.1.0
 - `livekit-server-sdk`: v2.15.0 (provides `RoomAgentDispatch`, `RoomConfiguration`)
+- `google-auth-library`: IAM auth for Cloud Run service-to-service calls
 - **Node.js runtime**: 22 (configured in `package.json` engines)
-
-## npm Scripts
-
-```bash
-npm run lint    # ESLint
-npm run serve   # Local emulator
-npm run shell   # Interactive shell
-npm run deploy  # Deploy to Firebase
-npm run logs    # View function logs
-```
 
 ## Agent Dispatch
 
 LiveKit's default automatic agent dispatch only fires for *new* rooms. The `tech-world` room has a 5-minute `empty_timeout` on LiveKit Cloud, so if users sign out and back in quickly the room persists and the bot never gets dispatched.
 
-The fix is **token-based dispatch**: `retrieveLiveKitToken` sets `at.roomConfig` with a `RoomAgentDispatch` entry. When the token is used to join a room, LiveKit reads the dispatch config and sends a job request to an available agent worker (the Clawd bot in `tech_world_bot`).
-
-The `agentName` is set to `""` (empty string), which dispatches to any registered worker without requiring a named agent.
+The fix is **token-based dispatch**: `retrieveLiveKitToken` sets `at.roomConfig` with named `RoomAgentDispatch` entries for both `"clawd"` and `"gremlin"`. When the token is used to join a room, LiveKit reads the dispatch config and sends job requests to the matching agent workers.
 
 ## Notes
 
 - Uses Firebase Functions v2 style but Auth trigger from v1
 - LiveKit SDK imported dynamically in each function (ESM package in CommonJS context)
-- Token stored in Firestore for client retrieval (`saveDoc` function)
 - Node.js 18 was decommissioned 2025-10-30; runtime upgraded to Node.js 22
