@@ -15,6 +15,20 @@ const admin = require("firebase-admin");
 admin.initializeApp();
 
 /**
+ * Validate that required LiveKit env vars are set.
+ * @return {{key: string, secret: string}}
+ */
+function requireLiveKitEnv() {
+  const key = process.env.LIVEKIT_API_KEY;
+  const secret = process.env.LIVEKIT_API_SECRET;
+  if (!key || !secret) {
+    throw new HttpsError("internal",
+        "Server misconfigured: missing LiveKit credentials");
+  }
+  return {key, secret};
+}
+
+/**
  * Callable function to retrieve a LiveKit token for the authenticated user.
  * Called by the Flutter client when connecting to a room.
  */
@@ -29,6 +43,8 @@ exports.retrieveLiveKitToken = onCall(async (request) => {
     throw new HttpsError("invalid-argument", "roomName is required");
   }
 
+  const {key, secret} = requireLiveKitEnv();
+
   const {
     AccessToken,
     RoomAgentDispatch,
@@ -39,15 +55,11 @@ exports.retrieveLiveKitToken = onCall(async (request) => {
                    request.auth.token.email ||
                    "Guest";
 
-  const at = new AccessToken(
-      process.env.LIVEKIT_API_KEY,
-      process.env.LIVEKIT_API_SECRET,
-      {
-        identity: request.auth.uid,
-        name: userName,
-        ttl: "1h",
-      },
-  );
+  const at = new AccessToken(key, secret, {
+    identity: request.auth.uid,
+    name: userName,
+    ttl: "1h",
+  });
 
   at.addGrant({
     roomJoin: true,
@@ -106,17 +118,14 @@ exports.getBotToken = onCall(async (request) => {
         `Unknown bot "${botName}". Valid: ${valid}`);
   }
 
+  const {key, secret} = requireLiveKitEnv();
   const {AccessToken} = await import("livekit-server-sdk");
 
-  const at = new AccessToken(
-      process.env.LIVEKIT_API_KEY,
-      process.env.LIVEKIT_API_SECRET,
-      {
-        identity: bot.identity,
-        name: bot.name,
-        ttl: "24h", // Bot stays connected longer
-      },
-  );
+  const at = new AccessToken(key, secret, {
+    identity: bot.identity,
+    name: bot.name,
+    ttl: "24h", // Bot stays connected longer
+  });
 
   at.addGrant({
     roomJoin: true,
