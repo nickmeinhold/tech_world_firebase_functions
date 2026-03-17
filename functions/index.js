@@ -70,9 +70,14 @@ exports.retrieveLiveKitToken = onCall(async (request) => {
 });
 
 /**
- * Callable function to retrieve a LiveKit token for the bot service.
- * The bot joins as 'bot-claude' participant.
+ * Callable function to retrieve a LiveKit token for a bot service.
+ * Supports both Clawd and Gremlin bots via the `botName` parameter.
  */
+const BOT_IDENTITIES = {
+  clawd: {identity: "bot-claude", name: "Clawd"},
+  gremlin: {identity: "bot-gremlin", name: "Gremlin"},
+};
+
 exports.getBotToken = onCall(async (request) => {
   // Verify request contains bot secret using timing-safe comparison.
   // Guards against: (1) undefined BOT_SECRET env var, (2) timing attacks.
@@ -93,14 +98,22 @@ exports.getBotToken = onCall(async (request) => {
     throw new HttpsError("invalid-argument", "roomName is required");
   }
 
+  const botName = request.data.botName || "clawd";
+  const bot = BOT_IDENTITIES[botName];
+  if (!bot) {
+    const valid = Object.keys(BOT_IDENTITIES).join(", ");
+    throw new HttpsError("invalid-argument",
+        `Unknown bot "${botName}". Valid: ${valid}`);
+  }
+
   const {AccessToken} = await import("livekit-server-sdk");
 
   const at = new AccessToken(
       process.env.LIVEKIT_API_KEY,
       process.env.LIVEKIT_API_SECRET,
       {
-        identity: "bot-claude",
-        name: "Clawd",
+        identity: bot.identity,
+        name: bot.name,
         ttl: "24h", // Bot stays connected longer
       },
   );
@@ -114,10 +127,15 @@ exports.getBotToken = onCall(async (request) => {
   });
 
   const token = await at.toJwt();
-  functions.logger.info(`Bot token generated for room ${roomName}`);
+  functions.logger.info(
+      `Bot token generated for ${bot.name} in room ${roomName}`,
+  );
   return token;
 });
 
+// TODO: Review whether saveDoc is still needed — it generates a token with
+// a hardcoded room name "room" that doesn't match the dynamic room names
+// used by retrieveLiveKitToken. May be legacy from an earlier architecture.
 exports.saveDoc = functions.auth.user().onCreate(async (user) => {
   functions.logger.info(`Email: ${user.email}, User ID: ${user.uid}`,
       {structuredData: true});
