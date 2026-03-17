@@ -14,6 +14,10 @@ const {onCall, HttpsError} = require("firebase-functions/v2/https");
 const admin = require("firebase-admin");
 admin.initializeApp();
 
+// Module-scoped GoogleAuth instance — reused across warm invocations.
+const {GoogleAuth} = require("google-auth-library");
+const googleAuth = new GoogleAuth();
+
 /**
  * Validate that required LiveKit env vars are set.
  * @return {{key: string, secret: string}}
@@ -27,10 +31,6 @@ function requireLiveKitEnv() {
   }
   return {key, secret};
 }
-
-// Module-scoped GoogleAuth instance — reused across warm invocations.
-const {GoogleAuth} = require("google-auth-library");
-const googleAuth = new GoogleAuth();
 
 /**
  * Wake both bot Cloud Run services with fire-and-forget HTTP requests.
