@@ -10,7 +10,7 @@
 const functions = require("firebase-functions");
 const {onCall, HttpsError} = require("firebase-functions/v2/https");
 
-// The Firebase Admin SDK to access Firestore.
+// Firebase Admin SDK — initializeApp required for Cloud Functions runtime.
 const admin = require("firebase-admin");
 admin.initializeApp();
 
@@ -133,44 +133,4 @@ exports.getBotToken = onCall(async (request) => {
   return token;
 });
 
-// TODO: Review whether saveDoc is still needed — it generates a token with
-// a hardcoded room name "room" that doesn't match the dynamic room names
-// used by retrieveLiveKitToken. May be legacy from an earlier architecture.
-exports.saveDoc = functions.auth.user().onCreate(async (user) => {
-  functions.logger.info(`Email: ${user.email}, User ID: ${user.uid}`,
-      {structuredData: true});
-
-  const {AccessToken} = await import("livekit-server-sdk");
-
-  let livekitName = user.email;
-  if (livekitName == null) {
-    livekitName = "Guest";
-  }
-
-  const at = new AccessToken(
-      process.env.LIVEKIT_API_KEY,
-      process.env.LIVEKIT_API_SECRET, {
-        identity: user.uid,
-        name: livekitName,
-        ttl: "10m", // token to expire after 10 minutes
-      },
-  );
-
-  at.addGrant({roomJoin: true, room: "room"});
-
-  const token = await at.toJwt();
-
-  const writeResult = await admin
-      .firestore()
-      .collection("users")
-      .doc(user.uid).set({
-        name: user.displayName,
-        email: user.email,
-        token: token,
-      });
-
-  const timestamp = writeResult.writeTime.toDate().toLocaleString();
-  functions.logger.info(`Doc added: ${timestamp}.`);
-},
-);
 

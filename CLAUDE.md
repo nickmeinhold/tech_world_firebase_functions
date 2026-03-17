@@ -38,13 +38,10 @@ Called by Flutter client to get a LiveKit token for joining a room. Dispatches b
 
 Called by bot service to get a LiveKit token for joining as a bot participant.
 
-**Parameters:** `{ roomName: string, botSecret: string }`
+**Parameters:** `{ roomName: string, botSecret: string, botName?: string }`
 **Returns:** LiveKit JWT token
 **Auth:** Requires matching `BOT_SECRET` env var (timing-safe comparison)
-
-### saveDoc (v1 auth trigger)
-
-Auth trigger that fires on user creation. Stores user info and a short-lived LiveKit token in Firestore.
+**Bot selection:** Optional `botName` parameter (`"clawd"` or `"gremlin"`, defaults to `"clawd"`)
 
 ## Configuration Required
 
