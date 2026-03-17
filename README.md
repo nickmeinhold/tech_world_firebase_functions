@@ -1,18 +1,18 @@
 # Tech World Firebase Functions
 
-Firebase Cloud Functions for the Tech World multiplayer game. Handles user creation events and LiveKit token generation.
+Firebase Cloud Functions for the Tech World multiplayer game. Handles LiveKit token generation with agent dispatch and Cloud Run bot wake-up.
 
 ## Features
 
-- Triggers on Firebase Auth user creation
-- Generates LiveKit access tokens for video chat
-- Stores user data and tokens in Firestore
+- Generates LiveKit access tokens with dual-bot agent dispatch (Clawd + Gremlin)
+- Wakes Cloud Run bot services on user join (scale-to-zero support)
+- Provides bot authentication for LiveKit room access
 
 ## Prerequisites
 
-- Node.js 18+
+- Node.js 22+
 - Firebase CLI (`npm install -g firebase-tools`)
-- Firebase project with Authentication and Firestore enabled
+- Firebase project with Authentication enabled
 - LiveKit account with API credentials
 
 ## Setup
@@ -34,6 +34,9 @@ Firebase Cloud Functions for the Tech World multiplayer game. Handles user creat
    ```sh
    LIVEKIT_API_KEY=<your-api-key>
    LIVEKIT_API_SECRET=<your-api-secret>
+   BOT_SECRET=<secure-secret-for-bot-auth>
+   CLAWD_BOT_URL=<cloud-run-url-for-clawd>
+   GREMLIN_BOT_URL=<cloud-run-url-for-gremlin>
    ```
 
 4. Login to Firebase:
@@ -58,41 +61,32 @@ npm run shell
 
 ## Deployment
 
-Deploy to Firebase:
-
 ```bash
 firebase deploy --only functions
-```
-
-Or use the npm script:
-
-```bash
-npm run deploy
 ```
 
 ## View Logs
 
 ```bash
-npm run logs
-# or
 firebase functions:log
 ```
 
 ## Functions
 
-### saveDoc
+### retrieveLiveKitToken
 
-Triggered when a new user is created in Firebase Auth. This function:
+Callable function that generates a LiveKit token for authenticated users. Includes `RoomAgentDispatch` for both Clawd and Gremlin bots, and sends fire-and-forget wake-up requests to their Cloud Run services.
 
-1. Creates a LiveKit access token for the user
-2. Stores user data (name, email, token) in Firestore `users` collection
+### getBotToken
+
+Callable function that generates a LiveKit token for bot services. Supports both Clawd and Gremlin via the `botName` parameter. Uses timing-safe secret comparison.
 
 ## Dependencies
 
-- `firebase-admin`: Firebase Admin SDK for Firestore access
+- `firebase-admin`: Firebase Admin SDK
 - `firebase-functions`: Cloud Functions framework
 - `livekit-server-sdk`: LiveKit token generation
-- `axios`: HTTP client
+- `google-auth-library`: IAM auth for Cloud Run service-to-service calls
 
 ## Project Structure
 

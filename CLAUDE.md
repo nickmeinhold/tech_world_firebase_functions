@@ -71,6 +71,6 @@ The fix is **token-based dispatch**: `retrieveLiveKitToken` sets `at.roomConfig`
 
 ## Notes
 
-- Uses Firebase Functions v2 style but Auth trigger from v1
+- All functions use Firebase Functions v2 style
 - LiveKit SDK imported dynamically in each function (ESM package in CommonJS context)
-- Node.js 18 was decommissioned 2025-10-30; runtime upgraded to Node.js 22
+- Node.js 22 runtime (configured in `package.json` engines)
