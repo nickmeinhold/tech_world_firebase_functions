@@ -28,6 +28,40 @@ function requireLiveKitEnv() {
   return {key, secret};
 }
 
+// Module-scoped GoogleAuth instance — reused across warm invocations.
+const {GoogleAuth} = require("google-auth-library");
+const googleAuth = new GoogleAuth();
+
+/**
+ * Wake both bot Cloud Run services with fire-and-forget HTTP requests.
+ *
+ * Uses Google Auth to generate an identity token for service-to-service
+ * IAM authentication. Failures are swallowed — LiveKit dispatch handles
+ * the race if a bot isn't ready yet.
+ */
+async function wakeBots() {
+  const urls = [
+    process.env.CLAWD_BOT_URL,
+    process.env.GREMLIN_BOT_URL,
+  ].filter(Boolean);
+
+  if (urls.length === 0) return;
+
+  await Promise.allSettled(
+      urls.map(async (url) => {
+        try {
+          const client = await googleAuth.getIdTokenClient(url);
+          await client.request({url, method: "POST", timeout: 5000});
+          functions.logger.info(`Woke bot at ${url}`);
+        } catch (err) {
+          functions.logger.warn(
+              `Failed to wake bot at ${url}:`, err.message,
+          );
+        }
+      }),
+  );
+}
+
 /**
  * Callable function to retrieve a LiveKit token for the authenticated user.
  * Called by the Flutter client when connecting to a room.
@@ -69,15 +103,24 @@ exports.retrieveLiveKitToken = onCall(async (request) => {
     canSubscribe: true,
   });
 
-  // Dispatch the Clawd bot agent when this user joins the room.
+  // Dispatch bot agents when this user joins the room.
   at.roomConfig = new RoomConfiguration({
-    agents: [new RoomAgentDispatch({agentName: "clawd"})],
+    agents: [
+      new RoomAgentDispatch({agentName: "clawd"}),
+      new RoomAgentDispatch({agentName: "gremlin"}),
+    ],
   });
 
   const token = await at.toJwt();
   functions.logger.info(
       `Token generated for user ${request.auth.uid} in room ${roomName}`,
   );
+
+  // Fire-and-forget: wake bot Cloud Run services so they're warm for dispatch.
+  wakeBots().catch((err) =>
+    functions.logger.warn("wakeBots error:", err.message),
+  );
+
   return token;
 });
 

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for docs-only changes
+        id: docs-check
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            FILES=$(gh pr view ${{ github.event.pull_request.number }} --json files --jq '.files[].path')
+          else
+            FILES=$(git diff --name-only HEAD~1 2>/dev/null || echo "")
+          fi
+          NON_DOCS=$(echo "$FILES" | grep -vE '\.(md|txt)$|^LICENSE' || true)
+          if [ -z "$NON_DOCS" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - uses: actions/setup-node@v4
+        if: steps.docs-check.outputs.skip != 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: functions/package-lock.json
+
+      - name: Install dependencies
+        if: steps.docs-check.outputs.skip != 'true'
+        run: cd functions && npm ci
+
+      - name: Lint
+        if: steps.docs-check.outputs.skip != 'true'
+        run: cd functions && npm run lint
