@@ -34,8 +34,6 @@ Firebase Cloud Functions for the Tech World multiplayer game. Handles LiveKit to
    LIVEKIT_API_KEY=<your-api-key>
    LIVEKIT_API_SECRET=<your-api-secret>
    BOT_SECRET=<secure-secret-for-bot-auth>
-   CLAWD_BOT_URL=<cloud-run-url-for-clawd>
-   GREMLIN_BOT_URL=<cloud-run-url-for-gremlin>
    ```
 
 4. Login to Firebase:
@@ -85,7 +83,6 @@ Callable function that generates a LiveKit token for bot services. Supports both
 - `firebase-admin`: Firebase Admin SDK
 - `firebase-functions`: Cloud Functions framework
 - `livekit-server-sdk`: LiveKit token generation
-- `google-auth-library`: IAM auth for Cloud Run service-to-service calls
 
 ## Project Structure
 
