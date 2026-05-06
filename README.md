@@ -1,11 +1,10 @@
 # Tech World Firebase Functions
 
-Firebase Cloud Functions for the Tech World multiplayer game. Handles LiveKit token generation with agent dispatch and Cloud Run bot wake-up.
+Firebase Cloud Functions for the Tech World multiplayer game. Handles LiveKit token generation with embedded agent dispatch.
 
 ## Features
 
-- Generates LiveKit access tokens with dual-bot agent dispatch (Clawd + Gremlin)
-- Wakes Cloud Run bot services on user join (scale-to-zero support)
+- Generates LiveKit access tokens with `RoomAgentDispatch` embedded in `RoomConfiguration` — ensures Clawd, Gremlin, and Dreamfinder bots are dispatched whether the room is new or already exists (token-based dispatch; not limited to new rooms)
 - Provides bot authentication for LiveKit room access
 
 ## Prerequisites
@@ -75,7 +74,7 @@ firebase functions:log
 
 ### retrieveLiveKitToken
 
-Callable function that generates a LiveKit token for authenticated users. Includes `RoomAgentDispatch` for both Clawd and Gremlin bots, and sends fire-and-forget wake-up requests to their Cloud Run services.
+Callable function that generates a LiveKit token for authenticated users. Embeds `RoomAgentDispatch` for Clawd, Gremlin, and Dreamfinder — ensuring bots are dispatched on every room join, new or existing.
 
 ### getBotToken
 
