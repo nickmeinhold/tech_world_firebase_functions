@@ -160,6 +160,60 @@ function isServiceIdentity(identity) {
 }
 
 /**
+ * Whether `identity` is safe to use verbatim as a `/presence` document id.
+ *
+ * The identity is attacker-influenceable in principle (it is whatever the
+ * signed token minted), so validate it before building a Firestore path:
+ * a "/" would address a subcollection, "." / ".." are reserved, and Firestore
+ * caps document ids at 1500 bytes. A pathological value is skipped (logged),
+ * not thrown — a single bad event must not fall into the catch-all.
+ * @param {*} identity Candidate identity from the webhook event.
+ * @return {boolean} True when usable as a document id.
+ */
+function isValidPresenceIdentity(identity) {
+  if (typeof identity !== "string" || identity.length === 0) return false;
+  if (identity === "." || identity === "..") return false;
+  if (identity.includes("/")) return false;
+  if (Buffer.byteLength(identity, "utf8") > 1500) return false;
+  return true;
+}
+
+/**
+ * Decide whether a presence snapshot should be reaped for a room event.
+ *
+ * Two independent staleness axes, both checked inside the caller's transaction:
+ *  - Room match: the doc must still point at the event's room. A user who moved
+ *    rooms has re-pointed `currentRoomId`, so a late event from the room they
+ *    left must not reap their new presence.
+ *  - Freshness watermark: room names are stable Firestore doc ids, so LiveKit
+ *    rooms reincarnate under the same name. A late `participant_left` (or a
+ *    `room_finished` racing a fresh join) can match the room yet describe an
+ *    OLDER session. We reap only when the presence write predates the event —
+ *    `lastSeen < event.createdAt`. Both are server-authoritative clocks
+ *    (Firestore server timestamp vs LiveKit server clock); we assume their skew
+ *    is far smaller than the human gap between leaving and rejoining a room,
+ *    which is the only interval this guard needs to resolve.
+ *
+ * Fail OPEN on missing signal: if `createdAtMs` is 0 (event carried no
+ * `createdAt`) or `lastSeen` is missing/non-Timestamp, fall back to the
+ * room-match-only decision rather than never cleaning — a surviving ghost is
+ * worse than the rare misreap the watermark exists to prevent, and the room
+ * guard already scopes the blast radius.
+ * @param {FirebaseFirestore.DocumentSnapshot} snap Presence doc snapshot.
+ * @param {string} roomName Event's room name.
+ * @param {number} createdAtMs Event `createdAt` in ms, or 0 if unknown.
+ * @return {boolean} True if the doc should be deleted.
+ */
+function shouldReapPresence(snap, roomName, createdAtMs) {
+  if (!snap.exists) return false;
+  if (snap.get("currentRoomId") !== roomName) return false;
+  if (!createdAtMs) return true; // no watermark — room match suffices
+  const lastSeen = snap.get("lastSeen");
+  if (!lastSeen || typeof lastSeen.toMillis !== "function") return true;
+  return lastSeen.toMillis() < createdAtMs;
+}
+
+/**
  * LiveKit webhook endpoint driving presence-ghost cleanup.
  *
  * The Flutter client writes `/presence/{userId}` on connect and deletes it on a
@@ -172,25 +226,27 @@ function isServiceIdentity(identity) {
  * Security: every request is authenticated with `WebhookReceiver`, which
  * verifies the LiveKit-signed JWT in the `Authorization` header against the raw
  * request body. We fail closed — a missing header, a bad signature, or an
- * unparseable body returns 4xx and no Firestore mutation happens.
+ * unparseable body returns 4xx and no Firestore mutation happens. A missing
+ * `rawBody` is a platform misconfiguration (500), a distinct failure from a
+ * bad signature (401) — the two must not share a status code.
  *
  * Once verified, processing errors still return 200: LiveKit retries non-2xx
  * responses, and deletes here are idempotent (a missed one self-heals on the
  * next event), so a transient Firestore hiccup must not trigger a retry storm.
  */
 exports.livekitWebhook = onRequest(async (req, res) => {
-  const {key, secret} = (() => {
-    const k = process.env.LIVEKIT_API_KEY;
-    const s = process.env.LIVEKIT_API_SECRET;
-    if (!k || !s) {
-      functions.logger.error("livekitWebhook: missing LiveKit credentials");
-      return {key: null, secret: null};
-    }
-    return {key: k, secret: s};
-  })();
+  // Webhooks are POSTs; reject anything else before doing any work.
+  if (req.method !== "POST") {
+    res.status(405).send("Method Not Allowed");
+    return;
+  }
+
+  const key = process.env.LIVEKIT_API_KEY;
+  const secret = process.env.LIVEKIT_API_SECRET;
   if (!key || !secret) {
     // Misconfiguration, not an attacker: 500 so LiveKit retries once creds
     // are set, rather than silently swallowing real events.
+    functions.logger.error("livekitWebhook: missing LiveKit credentials");
     res.status(500).send("Server misconfigured");
     return;
   }
@@ -202,13 +258,21 @@ exports.livekitWebhook = onRequest(async (req, res) => {
     return;
   }
 
+  // `rawBody` (the exact bytes LiveKit signed) is what the receiver re-hashes.
+  // Its absence is a runtime/platform fault, not a bad signature — 500 (retry),
+  // NOT 401, so the two failure modes stay distinguishable in logs and retries.
+  if (!Buffer.isBuffer(req.rawBody)) {
+    functions.logger.error("livekitWebhook: rawBody missing or not a Buffer");
+    res.status(500).send("Server misconfigured");
+    return;
+  }
+
   const {WebhookReceiver} = await import("livekit-server-sdk");
   const receiver = new WebhookReceiver(key, secret);
 
   let event;
   try {
-    // `rawBody` (Buffer) is required: WebhookReceiver re-hashes the exact bytes
-    // LiveKit signed. A re-serialized `req.body` would not match the signature.
+    // A re-serialized `req.body` would not match the signature — use rawBody.
     event = await receiver.receive(req.rawBody.toString(), authHeader);
   } catch (err) {
     functions.logger.warn(
@@ -221,29 +285,45 @@ exports.livekitWebhook = onRequest(async (req, res) => {
   try {
     const db = admin.firestore();
 
+    // `createdAt` is protobuf int64 seconds (a JS bigint), the moment LiveKit
+    // fired the event. 0/absent → watermark disabled downstream (fail open).
+    const createdAtMs = event.createdAt ? Number(event.createdAt) * 1000 : 0;
+
     switch (event.event) {
       case "participant_left": {
         const identity = event.participant && event.participant.identity;
         const roomName = event.room && event.room.name;
         if (!identity || !roomName) break;
         if (isServiceIdentity(identity)) break;
+        if (!isValidPresenceIdentity(identity)) {
+          functions.logger.warn(
+              `livekitWebhook: skipping pathological identity "${identity}"`,
+          );
+          break;
+        }
 
-        // Conditional delete: the user may have already moved to another room,
-        // in which case their presence doc now points at the *new* room. A late
-        // `participant_left` from the old room must not delete that fresh
-        // presence. The transaction reads-then-deletes atomically so a
-        // concurrent `enter` write can't slip between the check and the delete.
+        // Reap the user's presence doc only if it still points at this room
+        // AND predates the event (see shouldReapPresence). The transaction
+        // reads and deletes atomically so a concurrent `enter` (a rejoin)
+        // can't slip between the guard and the delete.
         const ref = db.collection("presence").doc(identity);
-        await db.runTransaction(async (tx) => {
+        const deleted = await db.runTransaction(async (tx) => {
           const snap = await tx.get(ref);
-          if (!snap.exists) return;
-          if (snap.get("currentRoomId") !== roomName) return;
+          if (!shouldReapPresence(snap, roomName, createdAtMs)) return false;
           tx.delete(ref);
+          return true;
         });
-        functions.logger.info(
-            `livekitWebhook: cleaned presence for ${identity} ` +
-            `leaving ${roomName}`,
-        );
+        if (deleted) {
+          functions.logger.info(
+              `livekitWebhook: cleaned presence for ${identity} ` +
+              `leaving ${roomName}`,
+          );
+        } else {
+          functions.logger.debug(
+              `livekitWebhook: participant_left for ${identity} — presence ` +
+              `not reaped (moved rooms, fresher session, or already gone)`,
+          );
+        }
         break;
       }
 
@@ -252,20 +332,30 @@ exports.livekitWebhook = onRequest(async (req, res) => {
         if (!roomName) break;
 
         // The room emptied and LiveKit tore it down: reap every presence doc
-        // still pointing at it. Batched delete keeps this a single round trip.
+        // still pointing at it. Per-doc transactions (not one blind batch) so
+        // each delete re-checks the room match AND freshness watermark at
+        // commit time — a fresh join under the reincarnated room name must
+        // survive — and so there is no 500-write batch cap. Room sizes are
+        // small (tens), so sequential transactions are cheap.
         // TODO(#1706): this is where clear-group-chat-on-empty will hook in —
         // retention semantics (delete vs archive vs keep) are still undecided,
         // so chat deletion is intentionally NOT implemented here yet.
         const stale = await db.collection("presence")
             .where("currentRoomId", "==", roomName)
             .get();
-        if (!stale.empty) {
-          const batch = db.batch();
-          stale.docs.forEach((doc) => batch.delete(doc.ref));
-          await batch.commit();
+        let reaped = 0;
+        for (const doc of stale.docs) {
+          const ref = doc.ref;
+          const deleted = await db.runTransaction(async (tx) => {
+            const snap = await tx.get(ref);
+            if (!shouldReapPresence(snap, roomName, createdAtMs)) return false;
+            tx.delete(ref);
+            return true;
+          });
+          if (deleted) reaped++;
         }
         functions.logger.info(
-            `livekitWebhook: room_finished reaped ${stale.size} ` +
+            `livekitWebhook: room_finished reaped ${reaped} ` +
             `presence doc(s) for ${roomName}`,
         );
         break;
