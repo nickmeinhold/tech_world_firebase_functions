@@ -178,6 +178,40 @@ function isValidPresenceIdentity(identity) {
   return true;
 }
 
+// Watermark validity band. Reject a createdAt outside a sane epoch window so a
+// seconds-vs-milliseconds unit drift in a future SDK can neither silently
+// disable the watermark (absurdly small value) nor future-pin it (absurdly
+// large value) — either way we fall back to the logged room-match-only path.
+const MIN_VALID_EVENT_MS = Date.UTC(2020, 0, 1);
+const CLOCK_TOLERANCE_MS = 24 * 60 * 60 * 1000; // 24h future tolerance
+
+// Clock-skew margin for the freshness comparison. LiveKit's clock running
+// ahead of Firestore's must not make an innocent fast rejoin look older than
+// the event. Ghosts are minutes old, so 10s of slack costs nothing and never
+// misreaps a live doc.
+const SKEW_BUDGET_MS = 10000;
+
+/**
+ * Convert a WebhookEvent `createdAt` (protobuf int64 seconds, a JS bigint) to
+ * epoch milliseconds, returning 0 — the "watermark disabled" sentinel — for
+ * anything absent or implausible. An invalid value is logged distinctly so the
+ * fail-open is observable, never silent.
+ * @param {*} createdAt Raw `event.createdAt` (bigint | number | undefined).
+ * @return {number} Epoch ms, or 0 if absent/invalid.
+ */
+function eventCreatedAtMs(createdAt) {
+  if (!createdAt) return 0; // absent or zero — no watermark to apply
+  const ms = Number(createdAt) * 1000;
+  if (!Number.isFinite(ms) || ms <= 0 ||
+      ms < MIN_VALID_EVENT_MS || ms > Date.now() + CLOCK_TOLERANCE_MS) {
+    functions.logger.warn(
+        `livekitWebhook: watermark disabled: invalid createdAt ${createdAt}`,
+    );
+    return 0;
+  }
+  return ms;
+}
+
 /**
  * Decide whether a presence snapshot should be reaped for a room event.
  *
@@ -188,17 +222,23 @@ function isValidPresenceIdentity(identity) {
  *  - Freshness watermark: room names are stable Firestore doc ids, so LiveKit
  *    rooms reincarnate under the same name. A late `participant_left` (or a
  *    `room_finished` racing a fresh join) can match the room yet describe an
- *    OLDER session. We reap only when the presence write predates the event —
- *    `lastSeen < event.createdAt`. Both are server-authoritative clocks
- *    (Firestore server timestamp vs LiveKit server clock); we assume their skew
- *    is far smaller than the human gap between leaving and rejoining a room,
- *    which is the only interval this guard needs to resolve.
+ *    OLDER session. We reap only when the presence write predates the event by
+ *    more than a skew margin — `lastSeen < event.createdAt - SKEW_BUDGET_MS`.
+ *    Both are server-authoritative clocks (Firestore server timestamp vs
+ *    LiveKit server clock); the margin absorbs a LiveKit-clock-ahead skew so an
+ *    innocent fast rejoin isn't mistaken for an older session. The interval
+ *    this guard resolves — the human gap between leaving and rejoining — dwarfs
+ *    both the skew and the margin.
  *
- * Fail OPEN on missing signal: if `createdAtMs` is 0 (event carried no
- * `createdAt`) or `lastSeen` is missing/non-Timestamp, fall back to the
- * room-match-only decision rather than never cleaning — a surviving ghost is
- * worse than the rare misreap the watermark exists to prevent, and the room
- * guard already scopes the blast radius.
+ * Two different failure directions on missing signal, deliberately:
+ *  - No event watermark (`createdAtMs === 0`): fail OPEN — fall back to the
+ *    room-match-only decision rather than never cleaning. A surviving ghost is
+ *    worse than a rare misreap, and the room guard still scopes the reap.
+ *  - Event HAS a watermark but `lastSeen` is missing/non-Timestamp: fail
+ *    CLOSED (do not reap). `PresenceService.enter` always writes a
+ *    serverTimestamp `lastSeen`, so with a valid watermark a missing one is a
+ *    malformed doc or a programmer omission, not legacy state — the
+ *    "ghost beats misreap" tradeoff must not silently absorb that.
  * @param {FirebaseFirestore.DocumentSnapshot} snap Presence doc snapshot.
  * @param {string} roomName Event's room name.
  * @param {number} createdAtMs Event `createdAt` in ms, or 0 if unknown.
@@ -207,10 +247,10 @@ function isValidPresenceIdentity(identity) {
 function shouldReapPresence(snap, roomName, createdAtMs) {
   if (!snap.exists) return false;
   if (snap.get("currentRoomId") !== roomName) return false;
-  if (!createdAtMs) return true; // no watermark — room match suffices
+  if (!createdAtMs) return true; // no event watermark — room match suffices
   const lastSeen = snap.get("lastSeen");
-  if (!lastSeen || typeof lastSeen.toMillis !== "function") return true;
-  return lastSeen.toMillis() < createdAtMs;
+  if (!lastSeen || typeof lastSeen.toMillis !== "function") return false;
+  return lastSeen.toMillis() < createdAtMs - SKEW_BUDGET_MS;
 }
 
 /**
@@ -230,9 +270,15 @@ function shouldReapPresence(snap, roomName, createdAtMs) {
  * `rawBody` is a platform misconfiguration (500), a distinct failure from a
  * bad signature (401) — the two must not share a status code.
  *
- * Once verified, processing errors still return 200: LiveKit retries non-2xx
- * responses, and deletes here are idempotent (a missed one self-heals on the
- * next event), so a transient Firestore hiccup must not trigger a retry storm.
+ * Response contract after verification is per-handler:
+ *  - `participant_left`: always 200, even on a processing error. The next
+ *    lifecycle event self-heals a missed delete, so redelivery buys nothing and
+ *    a retry storm is the only downside.
+ *  - `room_finished`: 200 when the sweep completes clean (or has nothing to
+ *    do), but 503 if any per-doc delete failed. This is a finished room's ONLY
+ *    retry path, and the deletes are conditional + idempotent, so LiveKit
+ *    redelivery is safe and wanted — a blanket 200 after a partial sweep would
+ *    be a false ACK that strands ghosts.
  */
 exports.livekitWebhook = onRequest(async (req, res) => {
   // Webhooks are POSTs; reject anything else before doing any work.
@@ -282,12 +328,15 @@ exports.livekitWebhook = onRequest(async (req, res) => {
     return;
   }
 
+  // 200 unless a room_finished sweep partially fails (→ 503, see below).
+  let responseStatus = 200;
+
   try {
     const db = admin.firestore();
 
-    // `createdAt` is protobuf int64 seconds (a JS bigint), the moment LiveKit
-    // fired the event. 0/absent → watermark disabled downstream (fail open).
-    const createdAtMs = event.createdAt ? Number(event.createdAt) * 1000 : 0;
+    // The moment LiveKit fired the event, validated to a sane epoch band.
+    // 0 → watermark disabled downstream (fail open); see eventCreatedAtMs.
+    const createdAtMs = eventCreatedAtMs(event.createdAt);
 
     switch (event.event) {
       case "participant_left": {
@@ -340,24 +389,58 @@ exports.livekitWebhook = onRequest(async (req, res) => {
         // TODO(#1706): this is where clear-group-chat-on-empty will hook in —
         // retention semantics (delete vs archive vs keep) are still undecided,
         // so chat deletion is intentionally NOT implemented here yet.
-        const stale = await db.collection("presence")
-            .where("currentRoomId", "==", roomName)
-            .get();
+        let stale;
+        try {
+          stale = await db.collection("presence")
+              .where("currentRoomId", "==", roomName)
+              .get();
+        } catch (queryErr) {
+          // Couldn't even enumerate the room's presence — nothing was reaped.
+          // 503 so LiveKit redelivers (redelivery is this room's only retry).
+          functions.logger.error(
+              `livekitWebhook: room_finished query failed for ${roomName}: ` +
+              `${queryErr}`,
+          );
+          responseStatus = 503;
+          break;
+        }
+
         let reaped = 0;
+        let skipped = 0;
+        let failed = 0;
         for (const doc of stale.docs) {
           const ref = doc.ref;
-          const deleted = await db.runTransaction(async (tx) => {
-            const snap = await tx.get(ref);
-            if (!shouldReapPresence(snap, roomName, createdAtMs)) return false;
-            tx.delete(ref);
-            return true;
-          });
-          if (deleted) reaped++;
+          try {
+            // Per-doc try/catch: a throw on one doc must not abandon the rest.
+            const deleted = await db.runTransaction(async (tx) => {
+              const snap = await tx.get(ref);
+              if (!shouldReapPresence(snap, roomName, createdAtMs)) {
+                return false;
+              }
+              tx.delete(ref);
+              return true;
+            });
+            if (deleted) {
+              reaped++;
+            } else {
+              skipped++;
+            }
+          } catch (docErr) {
+            failed++;
+            functions.logger.error(
+                `livekitWebhook: room_finished failed to reap ${ref.id} ` +
+                `in ${roomName}: ${docErr}`,
+            );
+          }
         }
         functions.logger.info(
-            `livekitWebhook: room_finished reaped ${reaped} ` +
-            `presence doc(s) for ${roomName}`,
+            `livekitWebhook: room_finished for ${roomName} — ` +
+            `attempted=${stale.size} reaped=${reaped} ` +
+            `skipped=${skipped} failed=${failed}`,
         );
+        // Honest completion: any per-doc failure → 503 so LiveKit redelivers
+        // (deletes are conditional + idempotent, so redelivery is safe).
+        if (failed > 0) responseStatus = 503;
         break;
       }
 
@@ -367,13 +450,14 @@ exports.livekitWebhook = onRequest(async (req, res) => {
         break;
     }
   } catch (err) {
-    // Verification already passed — this is a Firestore-side hiccup. Log and
-    // still return 200: deletes are idempotent and self-heal on the next
-    // event, so retries would only hammer without helping.
+    // Reached only by a participant_left throw (room_finished handles its own
+    // errors above). Verification already passed, so this is a Firestore-side
+    // hiccup; keep 200 — a missed participant_left self-heals on the next
+    // lifecycle event, so retries would only hammer without helping.
     functions.logger.error(`livekitWebhook: processing error: ${err}`);
   }
 
-  res.status(200).send("OK");
+  res.status(responseStatus).send(responseStatus === 200 ? "OK" : "Retry");
 });
 
 
