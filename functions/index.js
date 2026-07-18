@@ -280,7 +280,12 @@ function shouldReapPresence(snap, roomName, createdAtMs) {
  *    redelivery is safe and wanted — a blanket 200 after a partial sweep would
  *    be a false ACK that strands ghosts.
  */
-exports.livekitWebhook = onRequest(async (req, res) => {
+// `invoker: "public"` is public-by-design: the WebhookReceiver signature
+// verification below is the real auth, not Cloud Run IAM. Declaring it in code
+// keeps the public IAM binding self-healing across redeploys — otherwise a
+// deploy resets the invoker to private and LiveKit deliveries 401 until a
+// manual `gcloud run services add-iam-policy-binding` (see PR #5 incident).
+exports.livekitWebhook = onRequest({invoker: "public"}, async (req, res) => {
   // Webhooks are POSTs; reject anything else before doing any work.
   if (req.method !== "POST") {
     res.status(405).send("Method Not Allowed");
