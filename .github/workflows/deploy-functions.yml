@@ -120,6 +120,12 @@ jobs:
           service_account: ${{ env.DEPLOY_SA }}
           project_id: ${{ env.GCP_PROJECT }}
 
+      - name: Record deployed commit (audit)
+        # Radiate the exact commit being deployed into the run's summary so
+        # "what is live?" is one glance, not Actions-UI archaeology (cage-match
+        # #7, Tesla). No new trust surface — just a log line.
+        run: echo "Deploying functions from commit $GITHUB_SHA (main)" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Deploy Cloud Functions
         # --only functions scopes the deploy so it can never touch hosting,
         # rules, indexes, or data. NOTE: within the functions surface this
