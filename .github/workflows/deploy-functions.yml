@@ -1,0 +1,94 @@
+name: Deploy Cloud Functions
+
+# Deploy the Cloud Functions in this repo from `main`, in clean CI, so that
+# "deployed == main" holds BY CONSTRUCTION instead of depending on whatever
+# local working tree the person running `firebase deploy` happens to hold.
+#
+# WHY THIS EXISTS (the substrate root, 2026-07-21):
+#   The live `livekitWebhook` (presence-ghost cleanup) is deployed manually.
+#   A stale local checkout carrying uncommitted, pre-webhook edits can — on a
+#   single `firebase deploy` — DELETE the live webhook, because the deploy
+#   reflects the deployer's tree, not the repo. Deploying only ever from `main`
+#   in clean CI removes that coin-flip: the source of a deploy is always the
+#   reviewed, merged, single-source-of-truth branch.
+#
+# AUTH — keyless via Workload Identity Federation (no stored SA JSON key):
+#   GitHub's OIDC token is exchanged for short-lived GCP credentials. The
+#   deploy SA (github-functions-deployer) is bound with workloadIdentityUser
+#   ONLY to principalSet .../attribute.repository/<this repo>, so no other
+#   repository can impersonate it — the security boundary is the repo claim in
+#   the OIDC token, not a secret that could leak. Retires the long-lived-key
+#   concern (#20/#1290) for the functions deployer.
+#
+# TRIGGER — workflow_dispatch ONLY (deliberately, for now):
+#   Functions deploys carry arbitrary code and full project blast radius, so
+#   unlike the paths-filtered rules sync we do NOT auto-deploy on every push.
+#   A human triggers this from the Actions tab when a deploy is intended — but
+#   the deploy itself runs reproducibly from `main`, never from a laptop. Once
+#   the team is larger / past demo week, add a `push: [main]` trigger with a
+#   `functions/**` paths filter + an Environment approval gate.
+on:
+  workflow_dispatch:
+
+# WIF requires the job to mint an OIDC token; contents:read for checkout.
+permissions:
+  contents: read
+  id-token: write
+
+# Serialize deploys so two triggers can't race the same function set.
+concurrency:
+  group: deploy-functions
+  cancel-in-progress: false
+
+env:
+  GCP_PROJECT: adventures-in-tech-world-0
+  # Non-secret identifiers (a provider path/SA email buy an attacker nothing
+  # without an OIDC token from THIS repo — see the repo-scoped binding above).
+  WIF_PROVIDER: projects/614230417388/locations/global/workloadIdentityPools/workload-identity-pool/providers/github-actions-oidc
+  DEPLOY_SA: github-functions-deployer@adventures-in-tech-world-0.iam.gserviceaccount.com
+
+jobs:
+  deploy-functions:
+    runs-on: ubuntu-latest
+    steps:
+      # First-party actions pinned to immutable SHAs (not floating tags): this
+      # job can mint deploy credentials, so a moved tag must not be able to swap
+      # in new code under it (mirrors the rules sync hardening).
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: functions/package-lock.json
+
+      # Install runtime deps so the `predeploy` lint hook in firebase.json can run.
+      - name: Install function dependencies
+        run: cd functions && npm ci
+
+      - name: Install firebase-tools (pinned)
+        # Pinned exact version: firebase-tools runs with the exchanged
+        # credentials in scope, so a surprise (possibly compromised) release
+        # could exercise deploy rights. Bump deliberately, not implicitly.
+        run: npm install -g firebase-tools@15.22.1
+
+      - name: Authenticate to GCP (keyless, WIF)
+        # Exchanges this repo's GitHub OIDC token for short-lived GCP
+        # credentials for DEPLOY_SA and writes an ADC credentials file, exporting
+        # GOOGLE_APPLICATION_CREDENTIALS — which firebase-tools honours. No key.
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOY_SA }}
+
+      - name: Deploy Cloud Functions
+        # --only functions scopes the deploy so it can never touch hosting,
+        # rules, indexes, or data. firebase-tools reads the credentials from
+        # GOOGLE_APPLICATION_CREDENTIALS set by the auth step. firebase deploy is
+        # idempotent: only functions whose source/config changed are updated;
+        # unchanged functions are skipped, so re-running this is safe.
+        run: |
+          firebase deploy \
+            --only functions \
+            --project "$GCP_PROJECT" \
+            --non-interactive
