@@ -16,9 +16,9 @@ name: Deploy Cloud Functions
 # (cage-match #7, Carnot + Tesla — workflow_dispatch lets an operator pick ANY
 # branch, and checkout defaults to that ref, so comments alone would recreate
 # the exact "deploy an arbitrary tree" bug via the Actions UI):
-#   1. GitHub layer — `if: github.ref == 'refs/heads/main'` on the job (skips,
-#      i.e. deploys nothing, if dispatched from any other ref) + explicit
-#      `checkout ref: main`.
+#   1. GitHub layer — a first "Enforce deploy-from-main" step that FAILS LOUD
+#      (exit 1, red run) if dispatched from any ref other than main, and an
+#      explicit `checkout ref: ${{ github.sha }}` pinning the dispatch commit.
 #   2. GCP layer — the deployer SA's workloadIdentityUser is bound to
 #      `principal .../subject/repo:<repo>:ref:refs/heads/main` ONLY (not a
 #      repo-wide principalSet). GitHub's OIDC `sub` for a non-main ref won't
@@ -64,23 +64,33 @@ env:
 
 jobs:
   deploy-functions:
-    runs-on: ubuntu-latest
-    # GitHub-layer enforcement of "deploy only from main" — a dispatch from any
-    # other branch/tag skips the job entirely (nothing deploys). The GCP-layer
-    # ref-scoped WIF binding is the belt to this braces.
-    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04  # pinned, not ubuntu-latest, so the runner image can't shift under a deploy
     timeout-minutes: 20
     steps:
+      # GitHub-layer enforcement of "deploy only from main" — FAIL LOUD, not a
+      # silent job-level `if` skip (cage-match #7, Tesla P0): a skipped job shows
+      # green, which an operator reads as "prod matches main" when nothing ran.
+      # An explicit exit 1 turns a wrong-branch dispatch RED with a clear reason.
+      # (The GCP-layer ref-scoped WIF binding is the belt to this braces — STS
+      # won't mint a credential for a non-main `sub` even if this step is bypassed.)
+      - name: Enforce deploy-from-main (fail loud on wrong ref)
+        run: |
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "::error::Refusing to deploy from ${{ github.ref }} — this workflow deploys only from main."
+            exit 1
+          fi
+
       # First-party actions pinned to immutable SHAs (not floating tags): this
       # job can mint deploy credentials, so a moved tag must not be able to swap
       # in new code under it (mirrors the rules sync hardening).
-      # ref: main — explicit source pinning (redundant with the job `if` guard,
-      # but makes the deployed source unambiguous). persist-credentials: false —
-      # the job needs only the tree; don't leave GITHUB_TOKEN in git config for
-      # a later step or a compromised firebase-tools transitive to reuse.
+      # ref: github.sha — pin the EXACT dispatch commit, not the moving `main`
+      # branch name (cage-match #7, Carnot/Tesla): with `ref: main`, a merge that
+      # lands while this run is queued would deploy a newer commit than the one
+      # dispatched, breaking "this run deployed that commit". persist-credentials:
+      # false — the job needs only the tree; don't leave GITHUB_TOKEN in git config.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: main
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
