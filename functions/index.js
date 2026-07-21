@@ -95,6 +95,134 @@ const BOT_IDENTITIES = {
   gremlin: {identity: "bot-gremlin", name: "Gremlin"},
 };
 
+/**
+ * One-shot DM backfill — populates `participants: [uid1, uid2]` on legacy
+ * chat messages that predate the participants-array schema.
+ *
+ * Required because firestore.rules now demand `participants` on every DM read;
+ * messages without it become unreadable. Run this BEFORE deploying the rules
+ * change, or in the same window.
+ *
+ * Auth: gated on BACKFILL_SECRET env var (mirrors getBotToken pattern). Set
+ * the secret on the deployed function, invoke once, then unset.
+ *
+ * Parse: `conversationId` for DMs is `dm_<uid1>_<uid2>` where UIDs are
+ * sorted alphabetically (see lib/chat/conversation.dart:65). Firebase Auth
+ * UIDs are 28-char alphanumeric — no underscores — so `split('_')` yields
+ * exactly 3 parts. Anything else is skipped + logged.
+ *
+ * Idempotent: skips docs that already have `participants`. Skips group
+ * messages (conversationId === 'group') — the rule allows those without
+ * participants.
+ *
+ * Returns: {processed, updated, alreadySet, group, malformed, errors}.
+ */
+exports.backfillDmParticipants = onCall(
+    {timeoutSeconds: 540, memory: "512MiB"},
+    async (request) => {
+      const crypto = require("crypto");
+      const expected = process.env.BACKFILL_SECRET;
+      const provided = request.data && request.data.backfillSecret;
+      if (!expected || !provided || typeof provided !== "string") {
+        throw new HttpsError("permission-denied",
+            "Invalid backfill credentials");
+      }
+      const expectedHash = crypto.createHash("sha256")
+          .update(expected).digest();
+      const providedHash = crypto.createHash("sha256")
+          .update(provided).digest();
+      if (!crypto.timingSafeEqual(expectedHash, providedHash)) {
+        throw new HttpsError("permission-denied",
+            "Invalid backfill credentials");
+      }
+
+      const dryRun = request.data && request.data.dryRun === true;
+      const db = admin.firestore();
+      const counts = {
+        processed: 0,
+        updated: 0,
+        alreadySet: 0,
+        group: 0,
+        malformed: 0,
+        errors: 0,
+      };
+
+      // collectionGroup scans every `messages` subcollection across all rooms.
+      const snapshot = await db.collectionGroup("messages").get();
+      functions.logger.info(
+          `Backfill scanning ${snapshot.size} message docs (dryRun=${dryRun})`,
+      );
+
+      let batch = db.batch();
+      let batchSize = 0;
+      const FLUSH_AT = 450; // Firestore limit is 500; leave headroom.
+
+      for (const doc of snapshot.docs) {
+        counts.processed++;
+        const data = doc.data();
+
+        if (Array.isArray(data.participants) && data.participants.length > 0) {
+          counts.alreadySet++;
+          continue;
+        }
+        if (data.conversationId === "group") {
+          counts.group++;
+          continue;
+        }
+        if (typeof data.conversationId !== "string") {
+          counts.malformed++;
+          functions.logger.warn(
+              `Skipping ${doc.ref.path}: conversationId not a string`);
+          continue;
+        }
+
+        // Expected: dm_<uid1>_<uid2>
+        const parts = data.conversationId.split("_");
+        if (parts.length !== 3 || parts[0] !== "dm" ||
+            !parts[1] || !parts[2]) {
+          counts.malformed++;
+          functions.logger.warn(
+              `Skipping ${doc.ref.path}: ` +
+              `conversationId="${data.conversationId}" not parseable`);
+          continue;
+        }
+
+        const participants = [parts[1], parts[2]];
+        if (dryRun) {
+          counts.updated++;
+          continue;
+        }
+
+        batch.update(doc.ref, {participants});
+        batchSize++;
+        if (batchSize >= FLUSH_AT) {
+          try {
+            await batch.commit();
+            counts.updated += batchSize;
+          } catch (err) {
+            counts.errors += batchSize;
+            functions.logger.error(`Batch commit failed: ${err.message}`);
+          }
+          batch = db.batch();
+          batchSize = 0;
+        }
+      }
+
+      if (batchSize > 0 && !dryRun) {
+        try {
+          await batch.commit();
+          counts.updated += batchSize;
+        } catch (err) {
+          counts.errors += batchSize;
+          functions.logger.error(`Final batch commit failed: ${err.message}`);
+        }
+      }
+
+      functions.logger.info(`Backfill complete: ${JSON.stringify(counts)}`);
+      return counts;
+    },
+);
+
 exports.getBotToken = onCall(async (request) => {
   // Verify request contains bot secret using timing-safe comparison.
   // Guards against: (1) undefined BOT_SECRET env var, (2) timing attacks.
