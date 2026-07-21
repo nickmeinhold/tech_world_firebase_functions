@@ -1,0 +1,140 @@
+name: Deploy Cloud Functions
+
+# Deploy the Cloud Functions in this repo from `main`, in clean CI, so that
+# "deployed == main" holds BY CONSTRUCTION instead of depending on whatever
+# local working tree the person running `firebase deploy` happens to hold.
+#
+# WHY THIS EXISTS (the substrate root, 2026-07-21):
+#   The live `livekitWebhook` (presence-ghost cleanup) is deployed manually.
+#   A stale local checkout carrying uncommitted, pre-webhook edits can — on a
+#   single `firebase deploy` — DELETE the live webhook, because the deploy
+#   reflects the deployer's tree, not the repo. Deploying only ever from `main`
+#   in clean CI removes that coin-flip: the source of a deploy is always the
+#   reviewed, merged, single-source-of-truth branch.
+#
+# "DEPLOYED == main" IS ENFORCED AT TWO LAYERS, not asserted in prose
+# (cage-match #7, Carnot + Tesla — workflow_dispatch lets an operator pick ANY
+# branch, and checkout defaults to that ref, so comments alone would recreate
+# the exact "deploy an arbitrary tree" bug via the Actions UI):
+#   1. GitHub layer — a first "Enforce deploy-from-main" step that FAILS LOUD
+#      (exit 1, red run) if dispatched from any ref other than main, and an
+#      explicit `checkout ref: ${{ github.sha }}` pinning the dispatch commit.
+#   2. GCP layer — the deployer SA's workloadIdentityUser is bound to
+#      `principal .../subject/repo:<repo>:ref:refs/heads/main` ONLY (not a
+#      repo-wide principalSet). GitHub's OIDC `sub` for a non-main ref won't
+#      match, so STS refuses to mint a credential — a wrong-branch dispatch, or
+#      a malicious PR adding its own workflow (which runs on the PR branch, a
+#      different `sub`), cannot impersonate the deployer. RESIDUAL: another
+#      workflow running ON main could still impersonate (same `sub`); fully
+#      closing that needs an `attribute.workflow_ref` provider mapping — a
+#      follow-up, since code on main is already reviewed+merged.
+#
+# AUTH — keyless via Workload Identity Federation (no stored SA JSON key):
+#   GitHub's OIDC token is exchanged for short-lived GCP credentials. No secret
+#   can leak because none exists. Retires the long-lived-key concern (#20/#1290)
+#   for the functions deployer.
+#
+# TRIGGER — workflow_dispatch ONLY (deliberately, for now):
+#   Functions deploys carry arbitrary code and full project blast radius, so
+#   unlike the paths-filtered rules sync we do NOT auto-deploy on every push.
+#   A human triggers this from the Actions tab (from `main`) when a deploy is
+#   intended. Post-demo, a `push:[main]` trigger with a `functions/**` paths
+#   filter + a GitHub Environment approval gate can be added — but the two
+#   enforcement layers above MUST stay in place before that raises the cadence.
+on:
+  workflow_dispatch:
+
+# WIF requires the job to mint an OIDC token; contents:read for checkout.
+permissions:
+  contents: read
+  id-token: write
+
+# Serialize deploys so two triggers can't race the same function set.
+concurrency:
+  group: deploy-functions
+  cancel-in-progress: false
+
+env:
+  GCP_PROJECT: adventures-in-tech-world-0
+  # Non-secret identifiers (a provider path/SA email buy an attacker nothing
+  # without an OIDC token whose `sub` is this repo @ refs/heads/main — see the
+  # ref-scoped binding above).
+  WIF_PROVIDER: projects/614230417388/locations/global/workloadIdentityPools/workload-identity-pool/providers/github-actions-oidc
+  DEPLOY_SA: github-functions-deployer@adventures-in-tech-world-0.iam.gserviceaccount.com
+
+jobs:
+  deploy-functions:
+    runs-on: ubuntu-24.04  # pinned, not ubuntu-latest, so the runner image can't shift under a deploy
+    timeout-minutes: 20
+    steps:
+      # GitHub-layer enforcement of "deploy only from main" — FAIL LOUD, not a
+      # silent job-level `if` skip (cage-match #7, Tesla P0): a skipped job shows
+      # green, which an operator reads as "prod matches main" when nothing ran.
+      # An explicit exit 1 turns a wrong-branch dispatch RED with a clear reason.
+      # (The GCP-layer ref-scoped WIF binding is the belt to this braces — STS
+      # won't mint a credential for a non-main `sub` even if this step is bypassed.)
+      - name: Enforce deploy-from-main (fail loud on wrong ref)
+        run: |
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "::error::Refusing to deploy from ${{ github.ref }} — this workflow deploys only from main."
+            exit 1
+          fi
+
+      # First-party actions pinned to immutable SHAs (not floating tags): this
+      # job can mint deploy credentials, so a moved tag must not be able to swap
+      # in new code under it (mirrors the rules sync hardening).
+      # ref: github.sha — pin the EXACT dispatch commit, not the moving `main`
+      # branch name (cage-match #7, Carnot/Tesla): with `ref: main`, a merge that
+      # lands while this run is queued would deploy a newer commit than the one
+      # dispatched, breaking "this run deployed that commit". persist-credentials:
+      # false — the job needs only the tree; don't leave GITHUB_TOKEN in git config.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: functions/package-lock.json
+
+      # Install runtime deps so the `predeploy` lint hook in firebase.json can run.
+      - name: Install function dependencies
+        run: cd functions && npm ci
+
+      - name: Install firebase-tools (pinned)
+        # Pinned exact version: firebase-tools runs with the exchanged
+        # credentials in scope, so a surprise (possibly compromised) release
+        # could exercise deploy rights. Bump deliberately, not implicitly.
+        run: npm install -g firebase-tools@15.22.1
+
+      - name: Authenticate to GCP (keyless, WIF)
+        # Exchanges this repo's GitHub OIDC token for short-lived GCP
+        # credentials for DEPLOY_SA and writes an ADC credentials file, exporting
+        # GOOGLE_APPLICATION_CREDENTIALS — which firebase-tools honours. No key.
+        # The action's post-hook cleans up the credentials file automatically.
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOY_SA }}
+          project_id: ${{ env.GCP_PROJECT }}
+
+      - name: Record deployed commit (audit)
+        # Radiate the exact commit being deployed into the run's summary so
+        # "what is live?" is one glance, not Actions-UI archaeology (cage-match
+        # #7, Tesla). No new trust surface — just a log line.
+        run: echo "Deploying functions from commit $GITHUB_SHA (main)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy Cloud Functions
+        # --only functions scopes the deploy so it can never touch hosting,
+        # rules, indexes, or data. NOTE: within the functions surface this
+        # deploys the WHOLE function graph from the checked-out source (main) —
+        # its safety comes from that immutable source selection + scoped IAM,
+        # NOT from firebase-tools no-op behaviour. firebase-tools reads the
+        # credentials from GOOGLE_APPLICATION_CREDENTIALS set by the auth step.
+        run: |
+          firebase deploy \
+            --only functions \
+            --project "$GCP_PROJECT" \
+            --non-interactive
