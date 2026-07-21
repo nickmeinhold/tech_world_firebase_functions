@@ -12,21 +12,35 @@ name: Deploy Cloud Functions
 #   in clean CI removes that coin-flip: the source of a deploy is always the
 #   reviewed, merged, single-source-of-truth branch.
 #
+# "DEPLOYED == main" IS ENFORCED AT TWO LAYERS, not asserted in prose
+# (cage-match #7, Carnot + Tesla — workflow_dispatch lets an operator pick ANY
+# branch, and checkout defaults to that ref, so comments alone would recreate
+# the exact "deploy an arbitrary tree" bug via the Actions UI):
+#   1. GitHub layer — `if: github.ref == 'refs/heads/main'` on the job (skips,
+#      i.e. deploys nothing, if dispatched from any other ref) + explicit
+#      `checkout ref: main`.
+#   2. GCP layer — the deployer SA's workloadIdentityUser is bound to
+#      `principal .../subject/repo:<repo>:ref:refs/heads/main` ONLY (not a
+#      repo-wide principalSet). GitHub's OIDC `sub` for a non-main ref won't
+#      match, so STS refuses to mint a credential — a wrong-branch dispatch, or
+#      a malicious PR adding its own workflow (which runs on the PR branch, a
+#      different `sub`), cannot impersonate the deployer. RESIDUAL: another
+#      workflow running ON main could still impersonate (same `sub`); fully
+#      closing that needs an `attribute.workflow_ref` provider mapping — a
+#      follow-up, since code on main is already reviewed+merged.
+#
 # AUTH — keyless via Workload Identity Federation (no stored SA JSON key):
-#   GitHub's OIDC token is exchanged for short-lived GCP credentials. The
-#   deploy SA (github-functions-deployer) is bound with workloadIdentityUser
-#   ONLY to principalSet .../attribute.repository/<this repo>, so no other
-#   repository can impersonate it — the security boundary is the repo claim in
-#   the OIDC token, not a secret that could leak. Retires the long-lived-key
-#   concern (#20/#1290) for the functions deployer.
+#   GitHub's OIDC token is exchanged for short-lived GCP credentials. No secret
+#   can leak because none exists. Retires the long-lived-key concern (#20/#1290)
+#   for the functions deployer.
 #
 # TRIGGER — workflow_dispatch ONLY (deliberately, for now):
 #   Functions deploys carry arbitrary code and full project blast radius, so
 #   unlike the paths-filtered rules sync we do NOT auto-deploy on every push.
-#   A human triggers this from the Actions tab when a deploy is intended — but
-#   the deploy itself runs reproducibly from `main`, never from a laptop. Once
-#   the team is larger / past demo week, add a `push: [main]` trigger with a
-#   `functions/**` paths filter + an Environment approval gate.
+#   A human triggers this from the Actions tab (from `main`) when a deploy is
+#   intended. Post-demo, a `push:[main]` trigger with a `functions/**` paths
+#   filter + a GitHub Environment approval gate can be added — but the two
+#   enforcement layers above MUST stay in place before that raises the cadence.
 on:
   workflow_dispatch:
 
@@ -43,18 +57,31 @@ concurrency:
 env:
   GCP_PROJECT: adventures-in-tech-world-0
   # Non-secret identifiers (a provider path/SA email buy an attacker nothing
-  # without an OIDC token from THIS repo — see the repo-scoped binding above).
+  # without an OIDC token whose `sub` is this repo @ refs/heads/main — see the
+  # ref-scoped binding above).
   WIF_PROVIDER: projects/614230417388/locations/global/workloadIdentityPools/workload-identity-pool/providers/github-actions-oidc
   DEPLOY_SA: github-functions-deployer@adventures-in-tech-world-0.iam.gserviceaccount.com
 
 jobs:
   deploy-functions:
     runs-on: ubuntu-latest
+    # GitHub-layer enforcement of "deploy only from main" — a dispatch from any
+    # other branch/tag skips the job entirely (nothing deploys). The GCP-layer
+    # ref-scoped WIF binding is the belt to this braces.
+    if: github.ref == 'refs/heads/main'
+    timeout-minutes: 20
     steps:
       # First-party actions pinned to immutable SHAs (not floating tags): this
       # job can mint deploy credentials, so a moved tag must not be able to swap
       # in new code under it (mirrors the rules sync hardening).
+      # ref: main — explicit source pinning (redundant with the job `if` guard,
+      # but makes the deployed source unambiguous). persist-credentials: false —
+      # the job needs only the tree; don't leave GITHUB_TOKEN in git config for
+      # a later step or a compromised firebase-tools transitive to reuse.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          persist-credentials: false
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -76,17 +103,20 @@ jobs:
         # Exchanges this repo's GitHub OIDC token for short-lived GCP
         # credentials for DEPLOY_SA and writes an ADC credentials file, exporting
         # GOOGLE_APPLICATION_CREDENTIALS — which firebase-tools honours. No key.
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        # The action's post-hook cleans up the credentials file automatically.
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ env.WIF_PROVIDER }}
           service_account: ${{ env.DEPLOY_SA }}
+          project_id: ${{ env.GCP_PROJECT }}
 
       - name: Deploy Cloud Functions
         # --only functions scopes the deploy so it can never touch hosting,
-        # rules, indexes, or data. firebase-tools reads the credentials from
-        # GOOGLE_APPLICATION_CREDENTIALS set by the auth step. firebase deploy is
-        # idempotent: only functions whose source/config changed are updated;
-        # unchanged functions are skipped, so re-running this is safe.
+        # rules, indexes, or data. NOTE: within the functions surface this
+        # deploys the WHOLE function graph from the checked-out source (main) —
+        # its safety comes from that immutable source selection + scoped IAM,
+        # NOT from firebase-tools no-op behaviour. firebase-tools reads the
+        # credentials from GOOGLE_APPLICATION_CREDENTIALS set by the auth step.
         run: |
           firebase deploy \
             --only functions \
